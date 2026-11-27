@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict, deque
+from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
 import random
@@ -10,6 +11,8 @@ import time
 from typing import Any
 
 import pandas as pd
+
+from storage import TrafficDatabase
 
 try:
     from scapy.all import ARP, DNS, ICMP, IP, IPv6, TCP, UDP, get_if_list, sniff
@@ -27,6 +30,56 @@ HTTP_PORTS = {80, 8000, 8080}
 HTTPS_PORTS = {443, 8443}
 DNS_PORTS = {53, 5353}
 
+# Compact offline MAC OUI prefix registry for device identification
+OUI_VENDORS: dict[str, str] = {
+    "00:0C:29": "VMware",
+    "00:50:56": "VMware",
+    "08:00:27": "VirtualBox",
+    "52:54:00": "QEMU / KVM",
+    "00:15:5D": "Microsoft Hyper-V",
+    "00:1A:11": "Google",
+    "3C:5A:B4": "Google",
+    "B8:27:EB": "Raspberry Pi",
+    "DC:A6:32": "Raspberry Pi",
+    "E4:5F:01": "Raspberry Pi",
+    "00:1B:63": "Apple",
+    "3C:06:30": "Apple",
+    "F0:18:98": "Apple",
+    "00:1E:C9": "Dell",
+    "F8:BC:12": "Dell",
+    "00:1C:42": "Parallels",
+    "00:1D:7D": "Giga-Byte",
+    "00:25:90": "Super Micro",
+    "3C:D9:2B": "HP",
+    "00:0E:C6": "ASIX / USB-NIC",
+    "00:E0:4C": "Realtek",
+    "54:04:A6": "ASUSTek",
+    "18:D6:C7": "TP-Link",
+    "50:C7:BF": "TP-Link",
+    "C0:56:27": "Belkin / Linksys",
+    "00:09:5B": "Netgear",
+    "00:1F:33": "Netgear",
+    "00:14:22": "Dell",
+    "00:1B:21": "Intel",
+    "3C:97:0E": "Intel",
+    "A4:4C:C8": "Intel",
+    "D8:9E:F3": "Intel",
+    "00:00:0C": "Cisco",
+    "00:1B:D5": "Cisco",
+    "24:0A:C4": "Espressif (IoT)",
+    "AA:BB:CC": "Simulated Host NIC",
+    "DE:AD:BE": "Simulated Gateway",
+    "00:11:22": "Simulated Scanner",
+}
+
+SUSPICIOUS_PORT_LABELS: dict[int, str] = {
+    23: "Telnet (Unencrypted)",
+    445: "SMB",
+    3389: "RDP",
+    4444: "Metasploit / Reverse Shell",
+    5900: "VNC",
+}
+
 PACKET_COLUMNS = [
     "Timestamp",
     "Time",
@@ -42,8 +95,45 @@ PACKET_COLUMNS = [
 ]
 
 
+@dataclass
+class AlertConfig:
+    """Configurable thresholds for real-time security & anomaly detection."""
+
+    enable_port_scan: bool = True
+    port_scan_threshold: int = 10
+    port_scan_window_s: float = 10.0
+    enable_traffic_burst: bool = True
+    burst_packet_threshold: int = 200
+    burst_window_s: float = 5.0
+    enable_suspicious_ports: bool = True
+    suspicious_ports: tuple[int, ...] = (23, 445, 3389, 4444, 5900)
+    cooldown_s: float = 15.0
+
+
+def lookup_mac_vendor(mac: str) -> str:
+    """Identify vendor from a MAC address OUI prefix without external calls."""
+    if not mac or mac in {"-", "Unknown"}:
+        return "Unknown"
+    normalized = mac.strip().upper().replace("-", ":")
+    parts = normalized.split(":")
+    if len(parts) < 3:
+        return "Unknown"
+    prefix = ":".join(parts[:3])
+    if prefix in OUI_VENDORS:
+        return OUI_VENDORS[prefix]
+    if normalized == "FF:FF:FF:FF:FF:FF":
+        return "Broadcast"
+    try:
+        first_octet = int(parts[0], 16)
+        if first_octet & 0x02:
+            return "Private / Randomized MAC"
+    except ValueError:
+        return "Unknown"
+    return "Unrecognized OUI"
+
+
 def _detect_local_ips() -> set[str]:
-    """Return IPv4 addresses associated with this host for traffic direction tagging."""
+    """Return IP addresses associated with this host for traffic direction tagging."""
     ips = {"127.0.0.1", "::1"}
     try:
         hostname = socket.gethostname()
@@ -67,7 +157,7 @@ def _detect_local_ips() -> set[str]:
 @lru_cache(maxsize=512)
 def resolve_hostname(ip: str) -> str:
     """Resolve an IP address to a hostname, returning the original IP on failure."""
-    if not ip or ip in {"Unknown", "-"} or ":" in ip and ip.count(":") == 5:
+    if not ip or ip in {"Unknown", "-"} or (":" in ip and ip.count(":") == 5):
         return ip
     try:
         return socket.gethostbyaddr(ip)[0]
@@ -76,12 +166,19 @@ def resolve_hostname(ip: str) -> str:
 
 
 class NetworkAnalyzer:
-    """Thread-safe packet capture, protocol analysis, bandwidth, and anomaly engine."""
+    """Thread-safe packet capture, protocol analysis, bandwidth, device, and alert engine."""
 
-    def __init__(self, max_packets: int = 5000) -> None:
+    def __init__(
+        self,
+        max_packets: int = 5000,
+        db: TrafficDatabase | None = None,
+        enable_db: bool = True,
+    ) -> None:
         self.max_packets = max_packets
         self.packets: deque[dict[str, Any]] = deque(maxlen=max_packets)
         self.alerts: deque[dict[str, Any]] = deque(maxlen=200)
+        self.alert_config = AlertConfig()
+
         self.running = False
         self.mode = "idle"
         self.stop_event = Event()
@@ -90,15 +187,19 @@ class NetworkAnalyzer:
         self.error: str | None = None
         self.interface: str | None = None
 
+        self.db: TrafficDatabase | None = db if db is not None else (TrafficDatabase() if enable_db else None)
+        self.persist_to_db = self.db is not None
+
         self.local_ips: set[str] = _detect_local_ips()
         self.total_packets = 0
         self.total_bytes = 0
         self.upload_bytes = 0
         self.download_bytes = 0
         self.protocol_counts: Counter[str] = Counter()
+        self.devices: dict[str, dict[str, Any]] = {}
 
         # Sliding windows for anomaly detection
-        self._port_probe_window: dict[tuple[str, str], deque[tuple[float, int | str]]] = defaultdict(deque)
+        self._port_probe_window: dict[tuple[str, str], deque[tuple[float, int]]] = defaultdict(deque)
         self._rate_window: dict[str, deque[float]] = defaultdict(deque)
         self._recent_alert_keys: dict[tuple[str, str], float] = {}
 
@@ -114,6 +215,14 @@ class NetworkAnalyzer:
             return list(get_if_list())
         except Exception:
             return []
+
+    def update_alert_config(self, **kwargs: Any) -> AlertConfig:
+        """Update configurable security alert thresholds in a thread-safe way."""
+        with self.lock:
+            for key, value in kwargs.items():
+                if hasattr(self.alert_config, key):
+                    setattr(self.alert_config, key, value)
+            return self.alert_config
 
     def _classify_direction(self, src_ip: str, dst_ip: str) -> str:
         src_local = src_ip in self.local_ips
@@ -147,6 +256,32 @@ class NetworkAnalyzer:
             return "UDP"
         return "OTHER"
 
+    def _emit_alert(
+        self,
+        alert_key: tuple[str, str],
+        now: float,
+        time_str: str,
+        severity: str,
+        alert_type: str,
+        src: str,
+        dst: str,
+        details: str,
+    ) -> None:
+        if now - self._recent_alert_keys.get(alert_key, 0.0) <= self.alert_config.cooldown_s:
+            return
+        self._recent_alert_keys[alert_key] = now
+        alert = {
+            "Time": time_str,
+            "Severity": severity,
+            "Type": alert_type,
+            "Source": src,
+            "Destination": dst,
+            "Details": details,
+        }
+        self.alerts.appendleft(alert)
+        if self.persist_to_db and self.db is not None:
+            self.db.insert_alert(alert, timestamp=now)
+
     def _check_anomalies(self, record: dict[str, Any], now: float) -> None:
         src = str(record["Source"])
         dst = str(record["Destination"])
@@ -154,48 +289,97 @@ class NetworkAnalyzer:
         if src in {"Unknown", "-"}:
             return
 
-        # 1. Port scan detection: >= 10 distinct destination ports to same target within 10s
-        if isinstance(dport, int):
+        cfg = self.alert_config
+
+        # 1. Port scan detection
+        if cfg.enable_port_scan and isinstance(dport, int):
             key = (src, dst)
             probe_q = self._port_probe_window[key]
             probe_q.append((now, dport))
-            while probe_q and now - probe_q[0][0] > 10.0:
+            while probe_q and now - probe_q[0][0] > cfg.port_scan_window_s:
                 probe_q.popleft()
             distinct_ports = {p for _, p in probe_q}
-            if len(distinct_ports) >= 10:
-                alert_key = ("Port Scan", f"{src}->{dst}")
-                if now - self._recent_alert_keys.get(alert_key, 0.0) > 15.0:
-                    self._recent_alert_keys[alert_key] = now
-                    self.alerts.appendleft(
-                        {
-                            "Time": record["Time"],
-                            "Severity": "High",
-                            "Type": "Port Scan Detected",
-                            "Source": src,
-                            "Destination": dst,
-                            "Details": f"{len(distinct_ports)} distinct destination ports probed within 10s",
-                        }
-                    )
-
-        # 2. High packet burst detection: >= 200 packets from one source within 5s
-        rate_q = self._rate_window[src]
-        rate_q.append(now)
-        while rate_q and now - rate_q[0] > 5.0:
-            rate_q.popleft()
-        if len(rate_q) >= 200:
-            alert_key = ("Traffic Spike", src)
-            if now - self._recent_alert_keys.get(alert_key, 0.0) > 15.0:
-                self._recent_alert_keys[alert_key] = now
-                self.alerts.appendleft(
-                    {
-                        "Time": record["Time"],
-                        "Severity": "Medium",
-                        "Type": "High Traffic Burst",
-                        "Source": src,
-                        "Destination": dst,
-                        "Details": f"{len(rate_q)} packets from {src} in 5s",
-                    }
+            if len(distinct_ports) >= cfg.port_scan_threshold:
+                self._emit_alert(
+                    alert_key=("Port Scan", f"{src}->{dst}"),
+                    now=now,
+                    time_str=record["Time"],
+                    severity="High",
+                    alert_type="Port Scan Detected",
+                    src=src,
+                    dst=dst,
+                    details=(
+                        f"{len(distinct_ports)} distinct destination ports probed "
+                        f"within {cfg.port_scan_window_s:.0f}s"
+                    ),
                 )
+
+        # 2. Suspicious port detection
+        if cfg.enable_suspicious_ports and isinstance(dport, int) and dport in cfg.suspicious_ports:
+            label = SUSPICIOUS_PORT_LABELS.get(dport, f"Port {dport}")
+            self._emit_alert(
+                alert_key=("Suspicious Port", f"{src}->{dst}:{dport}"),
+                now=now,
+                time_str=record["Time"],
+                severity="Medium",
+                alert_type="Sensitive Port Activity",
+                src=src,
+                dst=dst,
+                details=f"Traffic observed on sensitive port {dport} ({label})",
+            )
+
+        # 3. High packet burst detection
+        if cfg.enable_traffic_burst:
+            rate_q = self._rate_window[src]
+            rate_q.append(now)
+            while rate_q and now - rate_q[0] > cfg.burst_window_s:
+                rate_q.popleft()
+            if len(rate_q) >= cfg.burst_packet_threshold:
+                self._emit_alert(
+                    alert_key=("Traffic Spike", src),
+                    now=now,
+                    time_str=record["Time"],
+                    severity="Medium",
+                    alert_type="High Traffic Burst",
+                    src=src,
+                    dst=dst,
+                    details=f"{len(rate_q)} packets from {src} in {cfg.burst_window_s:.0f}s",
+                )
+
+    def _update_device_registry(self, record: dict[str, Any]) -> None:
+        size = int(record["Size"])
+        time_str = str(record["Time"])
+        endpoints = [
+            (str(record["Source"]), str(record["Source MAC"]), True),
+            (str(record["Destination"]), str(record["Destination MAC"]), False),
+        ]
+        for ip, mac, is_sender in endpoints:
+            if ip in {"Unknown", "-"}:
+                continue
+            entry = self.devices.get(ip)
+            if entry is None:
+                role = "Local Host" if ip in self.local_ips else "Remote / Peer"
+                entry = {
+                    "IP Address": ip,
+                    "MAC Address": mac,
+                    "Vendor": lookup_mac_vendor(mac),
+                    "Role": role,
+                    "Packets Sent": 0,
+                    "Packets Received": 0,
+                    "Total Bytes": 0,
+                    "Last Seen": time_str,
+                }
+                self.devices[ip] = entry
+            elif entry["MAC Address"] in {"-", "Unknown"} and mac not in {"-", "Unknown"}:
+                entry["MAC Address"] = mac
+                entry["Vendor"] = lookup_mac_vendor(mac)
+
+            if is_sender:
+                entry["Packets Sent"] += 1
+            else:
+                entry["Packets Received"] += 1
+            entry["Total Bytes"] += size
+            entry["Last Seen"] = time_str
 
     def _record_metadata(self, record: dict[str, Any]) -> dict[str, Any]:
         now = float(record["Timestamp"])
@@ -212,7 +396,11 @@ class NetworkAnalyzer:
             elif direction == "Download":
                 self.download_bytes += size
             self.protocol_counts[protocol] += 1
+            self._update_device_registry(record)
             self._check_anomalies(record, now)
+
+        if self.persist_to_db and self.db is not None:
+            self.db.insert_packet(record)
 
         return record
 
@@ -296,7 +484,7 @@ class NetworkAnalyzer:
             self.error = (
                 f"Live capture failed: {exc}. "
                 "On Windows, ensure Npcap is installed and run with Administrator privileges; "
-                "on Linux/macOS, run with sudo/CAP_NET_RAW. You can also test using Demo Simulation."
+                "on Linux/macOS, run with sudo/CAP_NET_RAW. You can also test using Demo Mode."
             )
         finally:
             self.running = False
@@ -308,13 +496,13 @@ class NetworkAnalyzer:
             "192.168.1.42",
         )
         remote_hosts = [
-            "142.250.190.78",   # Google
-            "151.101.1.69",     # Fastly CDN
-            "104.16.132.229",   # Cloudflare
-            "8.8.8.8",          # Google DNS
-            "1.1.1.1",          # Cloudflare DNS
-            "192.168.1.1",      # Gateway
-            "52.94.236.248",    # AWS
+            ("142.250.190.78", "00:1A:11:44:55:66"),
+            ("151.101.1.69", "00:00:0C:77:88:99"),
+            ("104.16.132.229", "00:50:56:12:34:56"),
+            ("8.8.8.8", "00:1A:11:08:08:08"),
+            ("1.1.1.1", "00:00:0C:01:01:01"),
+            ("192.168.1.1", "DE:AD:BE:EF:00:01"),
+            ("192.168.1.105", "B8:27:EB:33:44:55"),
         ]
         profiles = [
             ("HTTPS", 443, (120, 1460), 0.42),
@@ -339,23 +527,30 @@ class NetworkAnalyzer:
                 proto = random.choices(protos, weights=weights, k=1)[0]
                 service_port, size_range = profile_map[proto]
                 is_upload = random.random() < 0.45
-                remote_ip = random.choice(remote_hosts)
+                remote_ip, remote_mac = random.choice(remote_hosts)
+                local_mac = "AA:BB:CC:11:22:33"
 
                 if proto == "ARP":
                     src_ip = local_ip if is_upload else "192.168.1.1"
                     dst_ip = "192.168.1.1" if is_upload else local_ip
+                    src_mac = local_mac if is_upload else "DE:AD:BE:EF:00:01"
+                    dst_mac = "DE:AD:BE:EF:00:01" if is_upload else local_mac
                     sport, dport = "-", "-"
                 elif proto == "ICMP":
                     src_ip = local_ip if is_upload else remote_ip
                     dst_ip = remote_ip if is_upload else local_ip
+                    src_mac = local_mac if is_upload else remote_mac
+                    dst_mac = remote_mac if is_upload else local_mac
                     sport, dport = "-", "-"
                 else:
                     ephemeral = random.randint(49152, 65000)
                     if is_upload:
                         src_ip, dst_ip = local_ip, remote_ip
+                        src_mac, dst_mac = local_mac, remote_mac
                         sport, dport = ephemeral, service_port
                     else:
                         src_ip, dst_ip = remote_ip, local_ip
+                        src_mac, dst_mac = remote_mac, local_mac
                         sport, dport = service_port, ephemeral
 
                 self._record_metadata(
@@ -367,8 +562,8 @@ class NetworkAnalyzer:
                         "Protocol": proto,
                         "Source Port": sport,
                         "Destination Port": dport,
-                        "Source MAC": "aa:bb:cc:11:22:33" if is_upload else "de:ad:be:ef:00:01",
-                        "Destination MAC": "de:ad:be:ef:00:01" if is_upload else "aa:bb:cc:11:22:33",
+                        "Source MAC": src_mac,
+                        "Destination MAC": dst_mac,
                         "Direction": self._classify_direction(src_ip, dst_ip),
                         "Size": random.randint(*size_range),
                     }
@@ -376,7 +571,7 @@ class NetworkAnalyzer:
 
             # Periodically emit a realistic port scan sequence so anomaly UI can be exercised
             tick += 1
-            if tick % 25 == 0:
+            if tick % 20 == 0:
                 scanner_ip = "192.168.1.99"
                 for probe_port in range(20, 32):
                     now = time.time()
@@ -390,7 +585,7 @@ class NetworkAnalyzer:
                             "Source Port": 55000 + probe_port,
                             "Destination Port": probe_port,
                             "Source MAC": "00:11:22:33:44:55",
-                            "Destination MAC": "aa:bb:cc:11:22:33",
+                            "Destination MAC": "AA:BB:CC:11:22:33",
                             "Direction": self._classify_direction(scanner_ip, local_ip),
                             "Size": 60,
                         }
@@ -408,7 +603,7 @@ class NetworkAnalyzer:
         if not SCAPY_AVAILABLE or sniff is None:
             self.error = (
                 f"Scapy is unavailable ({SCAPY_IMPORT_ERROR}). "
-                "Install dependencies or use Demo Simulation."
+                "Install dependencies or use Demo Mode."
             )
             return False
 
@@ -442,11 +637,12 @@ class NetworkAnalyzer:
         self.running = False
         self.mode = "idle"
 
-    def clear(self) -> None:
-        """Reset all captured packets, alerts, and traffic counters."""
+    def clear(self, clear_db: bool = False) -> None:
+        """Reset all in-memory captured packets, alerts, devices, and counters."""
         with self.lock:
             self.packets.clear()
             self.alerts.clear()
+            self.devices.clear()
             self.total_packets = 0
             self.total_bytes = 0
             self.upload_bytes = 0
@@ -456,6 +652,8 @@ class NetworkAnalyzer:
             self._rate_window.clear()
             self._recent_alert_keys.clear()
             self.error = None
+        if clear_db and self.db is not None:
+            self.db.clear_history()
 
     def get_dataframe(self) -> pd.DataFrame:
         """Return a thread-safe DataFrame snapshot of captured packet metadata."""
@@ -464,6 +662,26 @@ class NetworkAnalyzer:
         if not rows:
             return pd.DataFrame(columns=PACKET_COLUMNS)
         return pd.DataFrame(rows, columns=PACKET_COLUMNS)
+
+    def get_devices_dataframe(self) -> pd.DataFrame:
+        """Return observed network devices with MAC vendor identification and counters."""
+        with self.lock:
+            rows = [dict(v) for v in self.devices.values()]
+        columns = [
+            "IP Address",
+            "MAC Address",
+            "Vendor",
+            "Role",
+            "Packets Sent",
+            "Packets Received",
+            "Total Bytes",
+            "Last Seen",
+        ]
+        if not rows:
+            return pd.DataFrame(columns=columns)
+        df = pd.DataFrame(rows, columns=columns)
+        df["Total KB"] = (df["Total Bytes"] / 1024.0).round(2)
+        return df.sort_values("Total Bytes", ascending=False).reset_index(drop=True)
 
     def get_alerts(self) -> list[dict[str, Any]]:
         """Return a snapshot list of recent security/anomaly alerts."""
@@ -507,9 +725,62 @@ class NetworkAnalyzer:
                 "protocol_count": len(self.protocol_counts),
                 "unique_sources": len(src_ips),
                 "unique_destinations": len(dst_ips),
+                "device_count": len(self.devices),
                 "alert_count": len(self.alerts),
                 "error": self.error,
             }
+
+    def generate_markdown_report(self, filtered_df: pd.DataFrame | None = None) -> str:
+        """Build a formatted Markdown summary report for download."""
+        stats = self.get_stats()
+        df = filtered_df if filtered_df is not None else self.get_dataframe()
+        alerts = self.get_alerts()
+        devices_df = self.get_devices_dataframe()
+
+        lines = [
+            "# Network Traffic Analysis Report",
+            f"- Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"- Capture Mode: {stats['mode']} ({stats['interface']})",
+            f"- Total Session Packets: {stats['total_packets']:,}",
+            f"- Total Data Captured: {stats['total_mb']:.3f} MB (Upload: {stats['upload_mb']:.3f} MB | Download: {stats['download_mb']:.3f} MB)",
+            f"- Detected Protocols: {stats['protocol_count']}",
+            f"- Observed Devices: {stats['device_count']}",
+            f"- Security Alerts: {len(alerts)}",
+            "",
+        ]
+
+        if not df.empty:
+            lines.append("## Protocol Breakdown (Filtered View)")
+            for proto, count in df["Protocol"].value_counts().items():
+                lines.append(f"- **{proto}**: {count} packets")
+            lines.append("")
+
+            lines.append("## Top Source IP Addresses")
+            top_src = df.groupby("Source")["Size"].agg(["count", "sum"]).sort_values("count", ascending=False).head(5)
+            for ip, row in top_src.iterrows():
+                lines.append(f"- `{ip}`: {int(row['count'])} packets ({row['sum'] / 1024:.2f} KB)")
+            lines.append("")
+
+        if not devices_df.empty:
+            lines.append("## Top Observed Devices")
+            for _, row in devices_df.head(8).iterrows():
+                lines.append(
+                    f"- `{row['IP Address']}` ({row['MAC Address']}, {row['Vendor']} — {row['Role']}): "
+                    f"{row['Total KB']} KB"
+                )
+            lines.append("")
+
+        lines.append("## Security & Anomaly Alerts")
+        if alerts:
+            for alert in alerts[:20]:
+                lines.append(
+                    f"- [{alert['Severity']}] **{alert['Type']}** ({alert['Time']}): "
+                    f"`{alert['Source']}` → `{alert['Destination']}` — {alert['Details']}"
+                )
+        else:
+            lines.append("- No suspicious activity detected.")
+
+        return "\n".join(lines) + "\n"
 
 
 analyzer = NetworkAnalyzer()
